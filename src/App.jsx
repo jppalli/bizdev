@@ -3,7 +3,10 @@ import { read, utils } from "xlsx";
 import {
   createPlanningGame,
   deletePlanningGame,
+  exportLocalPlanningGames,
+  importPlanningGamesToSupabase,
   listPlanningGames,
+  migrateLocalPlanningGamesToSupabase,
   updatePlanningGamePosition
 } from "./lib/data";
 import { isSupabaseConfigured } from "./lib/supabase";
@@ -213,6 +216,54 @@ export default function App() {
     }
   }
 
+  function downloadLocalBackup() {
+    try {
+      const rows = exportLocalPlanningGames();
+      const blob = new Blob([JSON.stringify(rows, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "roadmap-local-backup.json";
+      a.click();
+      URL.revokeObjectURL(url);
+      setInfo(`Downloaded local backup (${rows.length} cards).`);
+    } catch (err) {
+      setError(err.message || "Could not export local backup.");
+    }
+  }
+
+  async function migrateLocalToSupabase() {
+    setError("");
+    setInfo("");
+    try {
+      const result = await migrateLocalPlanningGamesToSupabase();
+      setInfo(
+        `Migration complete: ${result.imported} imported, ${result.skipped} skipped (local cards: ${result.localCount}).`
+      );
+      await loadGames();
+    } catch (err) {
+      setError(err.message || "Could not migrate local data to Supabase.");
+    }
+  }
+
+  async function importJsonBackup(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError("");
+    setInfo("");
+    try {
+      const text = await file.text();
+      const rows = JSON.parse(text);
+      const result = await importPlanningGamesToSupabase(rows);
+      setInfo(`JSON import complete: ${result.imported} imported, ${result.skipped} skipped.`);
+      await loadGames();
+    } catch (err) {
+      setError(err.message || "Could not import JSON backup.");
+    } finally {
+      e.target.value = "";
+    }
+  }
+
   async function moveCard(cardId, targetYear, targetQuarter, targetIndex) {
     const moving = games.find((g) => g.id === cardId);
     if (!moving) return;
@@ -346,6 +397,12 @@ export default function App() {
             Import Spreadsheet
             <input type="file" accept=".xlsx,.xls,.csv" onChange={importSpreadsheet} />
           </label>
+          <button type="button" onClick={downloadLocalBackup}>Download Local JSON</button>
+          <label className="file top-file">
+            Import JSON to DB
+            <input type="file" accept=".json" onChange={importJsonBackup} />
+          </label>
+          <button type="button" onClick={migrateLocalToSupabase}>Migrate Local to DB</button>
           <button onClick={loadGames} disabled={loading || !isSupabaseConfigured}>
             {loading ? "Refreshing..." : "Refresh"}
           </button>

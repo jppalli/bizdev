@@ -172,6 +172,25 @@ function isPlanningTableMissing(error) {
   return String(error.message || "").includes("planning_games");
 }
 
+function planningKey(row) {
+  return `${String(row.game_name || "").toLowerCase()}|${row.plan_year}|${row.plan_quarter}`;
+}
+
+function toPlanningInsertPayload(row) {
+  return {
+    game_name: row.game_name || "Untitled",
+    studio_name: row.studio_name || null,
+    genre: row.genre || null,
+    platform: row.platform || null,
+    go_live_raw: row.go_live_raw || null,
+    plan_year: Number(row.plan_year) || 2026,
+    plan_quarter: Number(row.plan_quarter) || 1,
+    sort_order: Number(row.sort_order) || 0,
+    source: row.source || "manual",
+    notes: row.notes || null
+  };
+}
+
 export async function listPlanningGames() {
   if (!isSupabaseConfigured || !supabase) {
     return readLocalPlanningGames();
@@ -277,4 +296,46 @@ export async function deletePlanningGame(id) {
     throw error;
   }
   return true;
+}
+
+export function exportLocalPlanningGames() {
+  return readLocalPlanningGames();
+}
+
+export async function importPlanningGamesToSupabase(rows) {
+  requireSupabase();
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { imported: 0, skipped: 0, total: 0 };
+  }
+
+  const { data: existing, error: existingError } = await supabase
+    .from("planning_games")
+    .select("game_name,plan_year,plan_quarter");
+  if (existingError) throw existingError;
+
+  const seen = new Set((existing || []).map(planningKey));
+  let imported = 0;
+  let skipped = 0;
+
+  for (const row of rows) {
+    const payload = toPlanningInsertPayload(row);
+    const key = planningKey(payload);
+    if (seen.has(key)) {
+      skipped += 1;
+      continue;
+    }
+
+    const { error } = await supabase.from("planning_games").insert([payload]);
+    if (error) throw error;
+    seen.add(key);
+    imported += 1;
+  }
+
+  return { imported, skipped, total: rows.length };
+}
+
+export async function migrateLocalPlanningGamesToSupabase() {
+  const localRows = readLocalPlanningGames();
+  const result = await importPlanningGamesToSupabase(localRows);
+  return { ...result, localCount: localRows.length };
 }
