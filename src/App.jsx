@@ -1,12 +1,8 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { read, utils } from "xlsx";
 import {
   createPlanningGame,
   deletePlanningGame,
-  exportLocalPlanningGames,
-  importPlanningGamesToSupabase,
   listPlanningGames,
-  migrateLocalPlanningGamesToSupabase,
   updatePlanningGamePosition
 } from "./lib/data";
 import { isSupabaseConfigured } from "./lib/supabase";
@@ -44,28 +40,6 @@ function bucketKey(year, quarter) {
   return `${year}-Q${quarter}`;
 }
 
-function normalizeHeader(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
-}
-
-function getFieldValue(row, aliases) {
-  const aliasSet = new Set(aliases.map((a) => normalizeHeader(a)));
-  for (const [key, value] of Object.entries(row || {})) {
-    if (aliasSet.has(normalizeHeader(key))) return String(value || "").trim();
-  }
-  return "";
-}
-
-function parseGoLive(goLiveRaw) {
-  const text = String(goLiveRaw || "").toUpperCase();
-  const q = text.match(/Q([1-4])/);
-  if (!q) return null;
-  const y = text.match(/20(26|27)/);
-  return { quarter: Number(q[1]), year: y ? Number(y[0]) : 2026 };
-}
-
 export default function App() {
   const [games, setGames] = useState([]);
   const [form, setForm] = useState(emptyForm);
@@ -77,6 +51,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
   const [deleteCandidate, setDeleteCandidate] = useState(null);
+  const [editCandidate, setEditCandidate] = useState(null);
 
   const grouped = useMemo(() => {
     const map = {};
@@ -129,140 +104,7 @@ export default function App() {
     }
   }
 
-  async function importSpreadsheet(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setError("");
-    setInfo("Importing...");
-    try {
-      const buffer = await file.arrayBuffer();
-      const workbook = read(buffer, { type: "array" });
-      const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const matrix = utils.sheet_to_json(sheet, { header: 1, defval: "" });
-      const headerIndex = matrix.findIndex((row) =>
-        row.some((cell) => String(cell || "").toUpperCase().includes("GO LIVE"))
-      );
-      if (headerIndex < 0) throw new Error("No header row with GO LIVE found.");
-      const headers = matrix[headerIndex].map((h) => String(h || "").trim());
-      const rows = matrix.slice(headerIndex + 1).map((r) => {
-        const obj = {};
-        headers.forEach((h, i) => {
-          obj[h] = r[i] ?? "";
-        });
-        return obj;
-      });
-
-      const seen = new Set(
-        games.map((g) => `${String(g.game_name).toLowerCase()}|${g.plan_year}|${g.plan_quarter}`)
-      );
-      const nextOrder = {};
-      for (const y of YEARS) {
-        for (const q of QUARTERS) {
-          nextOrder[bucketKey(y, q)] = (grouped[bucketKey(y, q)] || []).length;
-        }
-      }
-
-      let added = 0;
-      let skipped = 0;
-      const inserted = [];
-
-      for (const row of rows) {
-        const goLive = getFieldValue(row, ["GO LIVE", "GoLive", "Launch Quarter", "Launch"]);
-        const parsed = parseGoLive(goLive);
-        if (!parsed) {
-          skipped += 1;
-          continue;
-        }
-
-        const gameName = getFieldValue(row, ["Game", "Game Name", "Title", "Name"]);
-        if (!gameName) {
-          skipped += 1;
-          continue;
-        }
-
-        const key = `${gameName.toLowerCase()}|${parsed.year}|${parsed.quarter}`;
-        if (seen.has(key)) {
-          skipped += 1;
-          continue;
-        }
-
-        const colKey = bucketKey(parsed.year, parsed.quarter);
-        const rowToInsert = {
-          game_name: gameName,
-          studio_name: getFieldValue(row, ["Source", "Developer/Studio", "Studio", "Developer"]) || null,
-          genre: getFieldValue(row, ["Genre"]) || null,
-          platform: null,
-          go_live_raw: goLive || null,
-          plan_year: parsed.year,
-          plan_quarter: parsed.quarter,
-          sort_order: nextOrder[colKey] || 0,
-          source: "spreadsheet"
-        };
-
-        const created = await createPlanningGame(rowToInsert);
-        inserted.push(created);
-        nextOrder[colKey] += 1;
-        seen.add(key);
-        added += 1;
-      }
-
-      if (inserted.length > 0) setGames((prev) => [...prev, ...inserted]);
-      setInfo(`Import complete: ${added} added, ${skipped} skipped.`);
-    } catch (err) {
-      setError(err.message || "Import failed.");
-      setInfo("");
-    } finally {
-      e.target.value = "";
-    }
-  }
-
-  function downloadLocalBackup() {
-    try {
-      const rows = exportLocalPlanningGames();
-      const blob = new Blob([JSON.stringify(rows, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "roadmap-local-backup.json";
-      a.click();
-      URL.revokeObjectURL(url);
-      setInfo(`Downloaded local backup (${rows.length} cards).`);
-    } catch (err) {
-      setError(err.message || "Could not export local backup.");
-    }
-  }
-
-  async function migrateLocalToSupabase() {
-    setError("");
-    setInfo("");
-    try {
-      const result = await migrateLocalPlanningGamesToSupabase();
-      setInfo(
-        `Migration complete: ${result.imported} imported, ${result.skipped} skipped (local cards: ${result.localCount}).`
-      );
-      await loadGames();
-    } catch (err) {
-      setError(err.message || "Could not migrate local data to Supabase.");
-    }
-  }
-
-  async function importJsonBackup(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setError("");
-    setInfo("");
-    try {
-      const text = await file.text();
-      const rows = JSON.parse(text);
-      const result = await importPlanningGamesToSupabase(rows);
-      setInfo(`JSON import complete: ${result.imported} imported, ${result.skipped} skipped.`);
-      await loadGames();
-    } catch (err) {
-      setError(err.message || "Could not import JSON backup.");
-    } finally {
-      e.target.value = "";
-    }
-  }
+  // import/migration tools removed by request; manual add/edit only
 
   async function moveCard(cardId, targetYear, targetQuarter, targetIndex) {
     const moving = games.find((g) => g.id === cardId);
@@ -366,6 +208,44 @@ export default function App() {
     setDeleteCandidate(null);
   }
 
+  function askEdit(card) {
+    setEditCandidate({
+      id: card.id,
+      game_name: card.game_name || "",
+      studio_name: card.studio_name || "",
+      genre: card.genre || "",
+      plan_year: card.plan_year,
+      plan_quarter: card.plan_quarter
+    });
+  }
+
+  async function confirmEditSave() {
+    if (!editCandidate?.id) return;
+    setError("");
+    setInfo("");
+    try {
+      const payload = {
+        game_name: editCandidate.game_name,
+        studio_name: editCandidate.studio_name || null,
+        genre: editCandidate.genre || null,
+        plan_year: Number(editCandidate.plan_year),
+        plan_quarter: Number(editCandidate.plan_quarter)
+      };
+      await updatePlanningGamePosition(editCandidate.id, payload);
+      setGames((prev) =>
+        prev.map((g) =>
+          g.id === editCandidate.id
+            ? { ...g, ...payload }
+            : g
+        )
+      );
+      setInfo("Card updated.");
+      setEditCandidate(null);
+    } catch (err) {
+      setError(err.message || "Could not update card.");
+    }
+  }
+
   function toggleCheck(cardId, checkKey) {
     setCardChecks((prev) => {
       const current = prev[cardId] || {};
@@ -393,16 +273,6 @@ export default function App() {
           <button type="button" onClick={() => setShowAddForm((v) => !v)}>
             {showAddForm ? "Close Add Game" : "+ Add Game"}
           </button>
-          <label className="file top-file">
-            Import Spreadsheet
-            <input type="file" accept=".xlsx,.xls,.csv" onChange={importSpreadsheet} />
-          </label>
-          <button type="button" onClick={downloadLocalBackup}>Download Local JSON</button>
-          <label className="file top-file">
-            Import JSON to DB
-            <input type="file" accept=".json" onChange={importJsonBackup} />
-          </label>
-          <button type="button" onClick={migrateLocalToSupabase}>Migrate Local to DB</button>
           <button onClick={loadGames} disabled={loading || !isSupabaseConfigured}>
             {loading ? "Refreshing..." : "Refresh"}
           </button>
@@ -503,6 +373,24 @@ export default function App() {
                                 })}
                                 <button
                                   type="button"
+                                  className="icon-btn edit-btn"
+                                  title="Edit card"
+                                  aria-label="Edit card"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    askEdit(card);
+                                  }}
+                                >
+                                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                                    <path
+                                      d="M3 17.25V21h3.75L19.81 7.94l-3.75-3.75L3 17.25zm17.71-10.04a1.003 1.003 0 000-1.42l-2.5-2.5a1.003 1.003 0 00-1.42 0l-1.83 1.83 3.75 3.75 2-2.08z"
+                                      fill="currentColor"
+                                    />
+                                  </svg>
+                                </button>
+                                <button
+                                  type="button"
                                   className="icon-btn danger-btn"
                                   title="Delete card"
                                   aria-label="Delete card"
@@ -547,6 +435,50 @@ export default function App() {
               </button>
               <button type="button" className="danger-btn" onClick={confirmDelete}>
                 Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {editCandidate && (
+        <div className="modal-backdrop" onClick={() => setEditCandidate(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Edit card</h3>
+            <div className="modal-form">
+              <input
+                value={editCandidate.game_name}
+                onChange={(e) => setEditCandidate({ ...editCandidate, game_name: e.target.value })}
+                placeholder="Game name"
+              />
+              <input
+                value={editCandidate.studio_name}
+                onChange={(e) => setEditCandidate({ ...editCandidate, studio_name: e.target.value })}
+                placeholder="Studio"
+              />
+              <input
+                value={editCandidate.genre}
+                onChange={(e) => setEditCandidate({ ...editCandidate, genre: e.target.value })}
+                placeholder="Genre"
+              />
+              <select
+                value={editCandidate.plan_year}
+                onChange={(e) => setEditCandidate({ ...editCandidate, plan_year: Number(e.target.value) })}
+              >
+                {YEARS.map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+              <select
+                value={editCandidate.plan_quarter}
+                onChange={(e) => setEditCandidate({ ...editCandidate, plan_quarter: Number(e.target.value) })}
+              >
+                {QUARTERS.map((q) => <option key={q} value={q}>Q{q}</option>)}
+              </select>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="secondary-btn" onClick={() => setEditCandidate(null)}>
+                Cancel
+              </button>
+              <button type="button" onClick={confirmEditSave}>
+                Save
               </button>
             </div>
           </div>

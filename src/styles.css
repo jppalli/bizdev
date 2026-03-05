@@ -281,6 +281,17 @@ select {
   padding: 0;
 }
 
+.edit-btn {
+  background: #e8f2ff;
+  color: #2b5d97;
+  border: 1px solid #b7cff0;
+}
+
+.edit-btn:hover {
+  background: #dbeafe;
+  transform: translateY(-1px);
+}
+
 .icon-btn svg {
   width: 16px;
   height: 16px;
@@ -341,6 +352,22 @@ select {
 .modal p {
   margin: 0 0 12px;
   color: var(--muted);
+}
+
+.modal-form {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.modal-form input,
+.modal-form select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: var(--surface-2);
+  color: var(--ink);
 }
 
 .modal-actions {
