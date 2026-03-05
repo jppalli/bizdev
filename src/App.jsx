@@ -1,398 +1,500 @@
-﻿import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
+import { read, utils } from "xlsx";
 import {
-  createContract,
-  createOpportunity,
-  createStudio,
-  createTask,
-  listContracts,
-  listOpportunities,
-  listStudios,
-  listTasks
+  createPlanningGame,
+  deletePlanningGame,
+  listPlanningGames,
+  updatePlanningGamePosition
 } from "./lib/data";
 import { isSupabaseConfigured } from "./lib/supabase";
 
-const TABS = ["Dashboard", "Studios", "Opportunities", "Contracts", "Tasks"];
+const YEARS = [2026, 2027];
+const QUARTERS = [1, 2, 3, 4];
 
-const emptyStudio = {
-  name: "",
-  website: "",
-  region: "",
-  genres: "",
-  reliability_score: 3
+const emptyForm = {
+  game_name: "",
+  studio_name: "",
+  genre: "",
+  plan_year: 2026,
+  plan_quarter: 1
 };
+const CARD_CHECKS_KEY = "roadmap_card_checks_v1";
+const CHECK_KEYS = ["qa", "art", "copy", "signed"];
 
-const emptyOpportunity = {
-  title: "",
-  studio_id: "",
-  status: "sourced",
-  fit_score: 3,
-  monetization_score: 3,
-  strategic_score: 3,
-  next_step: "",
-  owner: ""
-};
+function readCardChecks() {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(CARD_CHECKS_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 
-const emptyContract = {
-  studio_id: "",
-  game_title: "",
-  status: "draft",
-  revenue_share_pct: 50,
-  microtx_share_pct: 50,
-  start_date: "",
-  end_date: ""
-};
+function writeCardChecks(next) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(CARD_CHECKS_KEY, JSON.stringify(next));
+}
 
-const emptyTask = {
-  title: "",
-  status: "open",
-  priority: "medium",
-  due_date: "",
-  owner: "",
-  related_type: "opportunity"
-};
+function bucketKey(year, quarter) {
+  return `${year}-Q${quarter}`;
+}
 
-function badgeClass(status) {
-  const s = (status || "").toLowerCase();
-  if (["signed", "launched", "done"].includes(s)) return "badge good";
-  if (["rejected", "blocked", "overdue"].includes(s)) return "badge bad";
-  if (["negotiation", "evaluating", "in_progress", "draft"].includes(s)) return "badge warn";
-  return "badge";
+function normalizeHeader(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function getFieldValue(row, aliases) {
+  const aliasSet = new Set(aliases.map((a) => normalizeHeader(a)));
+  for (const [key, value] of Object.entries(row || {})) {
+    if (aliasSet.has(normalizeHeader(key))) return String(value || "").trim();
+  }
+  return "";
+}
+
+function parseGoLive(goLiveRaw) {
+  const text = String(goLiveRaw || "").toUpperCase();
+  const q = text.match(/Q([1-4])/);
+  if (!q) return null;
+  const y = text.match(/20(26|27)/);
+  return { quarter: Number(q[1]), year: y ? Number(y[0]) : 2026 };
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState("Dashboard");
+  const [games, setGames] = useState([]);
+  const [form, setForm] = useState(emptyForm);
+  const [dragId, setDragId] = useState("");
+  const [dropTarget, setDropTarget] = useState(null);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [cardChecks, setCardChecks] = useState(() => readCardChecks());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  const [deleteCandidate, setDeleteCandidate] = useState(null);
 
-  const [studios, setStudios] = useState([]);
-  const [opportunities, setOpportunities] = useState([]);
-  const [contracts, setContracts] = useState([]);
-  const [tasks, setTasks] = useState([]);
+  const grouped = useMemo(() => {
+    const map = {};
+    for (const y of YEARS) {
+      for (const q of QUARTERS) {
+        map[bucketKey(y, q)] = [];
+      }
+    }
+    for (const game of games) {
+      const key = bucketKey(game.plan_year, game.plan_quarter);
+      if (!map[key]) map[key] = [];
+      map[key].push(game);
+    }
+    Object.keys(map).forEach((k) => map[k].sort((a, b) => a.sort_order - b.sort_order));
+    return map;
+  }, [games]);
 
-  const [studioForm, setStudioForm] = useState(emptyStudio);
-  const [opportunityForm, setOpportunityForm] = useState(emptyOpportunity);
-  const [contractForm, setContractForm] = useState(emptyContract);
-  const [taskForm, setTaskForm] = useState(emptyTask);
-
-  const dashboard = useMemo(() => {
-    const openTasks = tasks.filter((t) => t.status !== "done").length;
-    const activeDeals = opportunities.filter((o) =>
-      ["contacted", "evaluating", "negotiation"].includes(o.status)
-    ).length;
-    const dueSoon = tasks.filter((t) => {
-      if (!t.due_date || t.status === "done") return false;
-      const due = new Date(t.due_date);
-      const now = new Date();
-      const in7 = new Date();
-      in7.setDate(now.getDate() + 7);
-      return due >= now && due <= in7;
-    }).length;
-    return {
-      studios: studios.length,
-      opportunities: opportunities.length,
-      contracts: contracts.length,
-      openTasks,
-      activeDeals,
-      dueSoon
-    };
-  }, [studios, opportunities, contracts, tasks]);
-
-  async function loadAll() {
+  async function loadGames() {
     if (!isSupabaseConfigured) return;
     setLoading(true);
     setError("");
     try {
-      const [studioRows, opportunityRows, contractRows, taskRows] = await Promise.all([
-        listStudios(),
-        listOpportunities(),
-        listContracts(),
-        listTasks()
-      ]);
-      setStudios(studioRows || []);
-      setOpportunities(opportunityRows || []);
-      setContracts(contractRows || []);
-      setTasks(taskRows || []);
+      const rows = await listPlanningGames();
+      setGames(rows || []);
     } catch (e) {
-      setError(e.message || "Failed to load data.");
+      setError(e.message || "Failed loading roadmap.");
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => {
-    loadAll();
+    loadGames();
   }, []);
 
-  async function submitStudio(e) {
+  async function addManualCard(e) {
     e.preventDefault();
     setError("");
+    setInfo("");
     try {
-      const row = await createStudio(studioForm);
-      setStudios((s) => [row, ...s]);
-      setStudioForm(emptyStudio);
+      const key = bucketKey(form.plan_year, form.plan_quarter);
+      const sortOrder = (grouped[key] || []).length;
+      const row = await createPlanningGame({ ...form, sort_order: sortOrder, source: "manual" });
+      setGames((prev) => [...prev, row]);
+      setForm(emptyForm);
+      setShowAddForm(false);
+      setInfo("Game added.");
     } catch (err) {
       setError(err.message);
     }
   }
 
-  async function submitOpportunity(e) {
-    e.preventDefault();
+  async function importSpreadsheet(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
     setError("");
+    setInfo("Importing...");
     try {
-      const row = await createOpportunity(opportunityForm);
-      setOpportunities((s) => [row, ...s]);
-      setOpportunityForm(emptyOpportunity);
+      const buffer = await file.arrayBuffer();
+      const workbook = read(buffer, { type: "array" });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const matrix = utils.sheet_to_json(sheet, { header: 1, defval: "" });
+      const headerIndex = matrix.findIndex((row) =>
+        row.some((cell) => String(cell || "").toUpperCase().includes("GO LIVE"))
+      );
+      if (headerIndex < 0) throw new Error("No header row with GO LIVE found.");
+      const headers = matrix[headerIndex].map((h) => String(h || "").trim());
+      const rows = matrix.slice(headerIndex + 1).map((r) => {
+        const obj = {};
+        headers.forEach((h, i) => {
+          obj[h] = r[i] ?? "";
+        });
+        return obj;
+      });
+
+      const seen = new Set(
+        games.map((g) => `${String(g.game_name).toLowerCase()}|${g.plan_year}|${g.plan_quarter}`)
+      );
+      const nextOrder = {};
+      for (const y of YEARS) {
+        for (const q of QUARTERS) {
+          nextOrder[bucketKey(y, q)] = (grouped[bucketKey(y, q)] || []).length;
+        }
+      }
+
+      let added = 0;
+      let skipped = 0;
+      const inserted = [];
+
+      for (const row of rows) {
+        const goLive = getFieldValue(row, ["GO LIVE", "GoLive", "Launch Quarter", "Launch"]);
+        const parsed = parseGoLive(goLive);
+        if (!parsed) {
+          skipped += 1;
+          continue;
+        }
+
+        const gameName = getFieldValue(row, ["Game", "Game Name", "Title", "Name"]);
+        if (!gameName) {
+          skipped += 1;
+          continue;
+        }
+
+        const key = `${gameName.toLowerCase()}|${parsed.year}|${parsed.quarter}`;
+        if (seen.has(key)) {
+          skipped += 1;
+          continue;
+        }
+
+        const colKey = bucketKey(parsed.year, parsed.quarter);
+        const rowToInsert = {
+          game_name: gameName,
+          studio_name: getFieldValue(row, ["Source", "Developer/Studio", "Studio", "Developer"]) || null,
+          genre: getFieldValue(row, ["Genre"]) || null,
+          platform: null,
+          go_live_raw: goLive || null,
+          plan_year: parsed.year,
+          plan_quarter: parsed.quarter,
+          sort_order: nextOrder[colKey] || 0,
+          source: "spreadsheet"
+        };
+
+        const created = await createPlanningGame(rowToInsert);
+        inserted.push(created);
+        nextOrder[colKey] += 1;
+        seen.add(key);
+        added += 1;
+      }
+
+      if (inserted.length > 0) setGames((prev) => [...prev, ...inserted]);
+      setInfo(`Import complete: ${added} added, ${skipped} skipped.`);
     } catch (err) {
-      setError(err.message);
+      setError(err.message || "Import failed.");
+      setInfo("");
+    } finally {
+      e.target.value = "";
     }
   }
 
-  async function submitContract(e) {
-    e.preventDefault();
-    setError("");
+  async function moveCard(cardId, targetYear, targetQuarter, targetIndex) {
+    const moving = games.find((g) => g.id === cardId);
+    if (!moving) return;
+
+    const sourceKey = bucketKey(moving.plan_year, moving.plan_quarter);
+    const targetKey = bucketKey(targetYear, targetQuarter);
+
+    const sourceList = (grouped[sourceKey] || []).filter((g) => g.id !== cardId);
+    const targetBase = sourceKey === targetKey ? sourceList : [...(grouped[targetKey] || [])];
+    const insertAt = Math.max(0, Math.min(targetIndex, targetBase.length));
+    const targetList = [...targetBase];
+    targetList.splice(insertAt, 0, { ...moving, plan_year: targetYear, plan_quarter: targetQuarter });
+
+    const sourceUpdates = sourceList.map((g, idx) => ({
+      id: g.id,
+      plan_year: g.plan_year,
+      plan_quarter: g.plan_quarter,
+      sort_order: idx
+    }));
+    const targetUpdates = targetList.map((g, idx) => ({
+      id: g.id,
+      plan_year: targetYear,
+      plan_quarter: targetQuarter,
+      sort_order: idx
+    }));
+
+    const merged = sourceKey === targetKey ? targetUpdates : [...sourceUpdates, ...targetUpdates];
+    const prev = games;
+
+    setGames((old) =>
+      old.map((g) => {
+        const match = merged.find((m) => m.id === g.id);
+        return match
+          ? { ...g, plan_year: match.plan_year, plan_quarter: match.plan_quarter, sort_order: match.sort_order }
+          : g;
+      })
+    );
+
     try {
-      const row = await createContract(contractForm);
-      setContracts((s) => [row, ...s]);
-      setContractForm(emptyContract);
+      await Promise.all(
+        merged.map((u) =>
+          updatePlanningGamePosition(u.id, {
+            plan_year: u.plan_year,
+            plan_quarter: u.plan_quarter,
+            sort_order: u.sort_order
+          })
+        )
+      );
     } catch (err) {
-      setError(err.message);
+      setGames(prev);
+      setError(err.message || "Could not move card.");
+    } finally {
+      setDropTarget(null);
     }
   }
 
-  async function submitTask(e) {
+  function handleCardDragOver(e, year, quarter, index) {
     e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const insertBefore = e.clientY < rect.top + rect.height / 2;
+    setDropTarget({
+      year,
+      quarter,
+      index: insertBefore ? index : index + 1
+    });
+  }
+
+  function handleColumnDragOver(e, year, quarter, cardsLength) {
+    e.preventDefault();
+    setDropTarget({ year, quarter, index: cardsLength });
+  }
+
+  async function removeCard(cardId) {
+    const prev = games;
+    setGames((old) => old.filter((g) => g.id !== cardId));
     setError("");
+    setInfo("");
     try {
-      const row = await createTask(taskForm);
-      setTasks((s) => [row, ...s]);
-      setTaskForm(emptyTask);
+      await deletePlanningGame(cardId);
+      setCardChecks((prevChecks) => {
+        const next = { ...prevChecks };
+        delete next[cardId];
+        writeCardChecks(next);
+        return next;
+      });
+      setInfo("Card deleted.");
     } catch (err) {
-      setError(err.message);
+      setGames(prev);
+      setError(err.message || "Could not delete card.");
     }
+  }
+
+  function askDelete(card) {
+    setDeleteCandidate({ id: card.id, game_name: card.game_name });
+  }
+
+  async function confirmDelete() {
+    if (!deleteCandidate?.id) return;
+    await removeCard(deleteCandidate.id);
+    setDeleteCandidate(null);
+  }
+
+  function toggleCheck(cardId, checkKey) {
+    setCardChecks((prev) => {
+      const current = prev[cardId] || {};
+      const nextForCard = {
+        ...current,
+        [checkKey]: !Boolean(current[checkKey])
+      };
+      const next = {
+        ...prev,
+        [cardId]: nextForCard
+      };
+      writeCardChecks(next);
+      return next;
+    });
   }
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <h1>BizDev Hub</h1>
-        <p>Arkadium publishing workflow</p>
-        <nav>
-          {TABS.map((tab) => (
-            <button
-              key={tab}
-              className={tab === activeTab ? "nav-btn active" : "nav-btn"}
-              onClick={() => setActiveTab(tab)}
-            >
-              {tab}
-            </button>
-          ))}
-        </nav>
-      </aside>
-
-      <main className="content">
-        <header className="topbar">
-          <h2>{activeTab}</h2>
-          <button onClick={loadAll} disabled={loading || !isSupabaseConfigured}>
+    <div className="app">
+      <header className="top">
+        <div>
+          <h1>Game Roadmap Planner</h1>
+          <p>Import Excel and drag cards across 2026 and 2027 quarters.</p>
+        </div>
+        <div className="top-actions">
+          <button type="button" onClick={() => setShowAddForm((v) => !v)}>
+            {showAddForm ? "Close Add Game" : "+ Add Game"}
+          </button>
+          <label className="file top-file">
+            Import Spreadsheet
+            <input type="file" accept=".xlsx,.xls,.csv" onChange={importSpreadsheet} />
+          </label>
+          <button onClick={loadGames} disabled={loading || !isSupabaseConfigured}>
             {loading ? "Refreshing..." : "Refresh"}
           </button>
-        </header>
+        </div>
+      </header>
 
-        {!isSupabaseConfigured && (
-          <div className="notice">
-            Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to a `.env` file.
+      {showAddForm && (
+        <section className="panel add-panel">
+          <form className="inline-form" onSubmit={addManualCard}>
+            <input required placeholder="Game name" value={form.game_name} onChange={(e) => setForm({ ...form, game_name: e.target.value })} />
+            <input placeholder="Studio (optional)" value={form.studio_name} onChange={(e) => setForm({ ...form, studio_name: e.target.value })} />
+            <input placeholder="Genre (optional)" value={form.genre} onChange={(e) => setForm({ ...form, genre: e.target.value })} />
+            <select value={form.plan_year} onChange={(e) => setForm({ ...form, plan_year: Number(e.target.value) })}>
+              {YEARS.map((y) => <option key={y} value={y}>{y}</option>)}
+            </select>
+            <select value={form.plan_quarter} onChange={(e) => setForm({ ...form, plan_quarter: Number(e.target.value) })}>
+              {QUARTERS.map((q) => <option key={q} value={q}>Q{q}</option>)}
+            </select>
+            <button disabled={!isSupabaseConfigured}>Create Card</button>
+          </form>
+        </section>
+      )}
+
+      {!isSupabaseConfigured && (
+        <div className="notice">Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in `.env`.</div>
+      )}
+      {error && <div className="error">{error}</div>}
+      {info && <div className="notice">{info}</div>}
+
+      <div className="board">
+          {YEARS.map((year) => (
+            <section key={year} className="year">
+              <h2>{year}</h2>
+              <div className="quarters">
+                {QUARTERS.map((quarter) => {
+                  const key = bucketKey(year, quarter);
+                  const cards = grouped[key] || [];
+                  return (
+                    <div
+                      key={key}
+                      className="quarter"
+                      onDragOver={(e) => handleColumnDragOver(e, year, quarter, cards.length)}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (!dragId) return;
+                        const targetIndex =
+                          dropTarget &&
+                          dropTarget.year === year &&
+                          dropTarget.quarter === quarter
+                            ? dropTarget.index
+                            : cards.length;
+                        moveCard(dragId, year, quarter, targetIndex);
+                        setDragId("");
+                      }}
+                    >
+                      <div className="quarterHead">
+                        <strong>Q{quarter}</strong>
+                        <span>{cards.length} games</span>
+                      </div>
+                      <ul>
+                        {cards.map((card, index) => (
+                          <Fragment key={card.id}>
+                            {dragId &&
+                              dropTarget &&
+                              dropTarget.year === year &&
+                              dropTarget.quarter === quarter &&
+                              dropTarget.index === index && <li className="drop-line" aria-hidden="true" />}
+                            <li
+                              draggable
+                              onDragStart={() => setDragId(card.id)}
+                              onDragEnd={() => {
+                                setDragId("");
+                                setDropTarget(null);
+                              }}
+                              onDragOver={(e) => handleCardDragOver(e, year, quarter, index)}
+                              className={dragId === card.id ? "is-dragging" : ""}
+                            >
+                              <strong>{card.game_name}</strong>
+                              <span>{card.studio_name || "Studio: blank"}</span>
+                              <span>{card.genre || "Genre: blank"}</span>
+                              <div className="card-actions">
+                                {CHECK_KEYS.map((key) => {
+                                  const active = Boolean(cardChecks[card.id]?.[key]);
+                                  return (
+                                    <button
+                                      key={`${card.id}-${key}`}
+                                      type="button"
+                                      className={active ? "toggle-btn active" : "toggle-btn"}
+                                      onClick={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        toggleCheck(card.id, key);
+                                      }}
+                                    >
+                                      {key.toUpperCase()}
+                                    </button>
+                                  );
+                                })}
+                                <button
+                                  type="button"
+                                  className="icon-btn danger-btn"
+                                  title="Delete card"
+                                  aria-label="Delete card"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    askDelete(card);
+                                  }}
+                                >
+                                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                                    <path
+                                      d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9zM7 9h2v9H7V9z"
+                                      fill="currentColor"
+                                    />
+                                  </svg>
+                                </button>
+                              </div>
+                            </li>
+                          </Fragment>
+                        ))}
+                        {dragId &&
+                          dropTarget &&
+                          dropTarget.year === year &&
+                          dropTarget.quarter === quarter &&
+                          dropTarget.index === cards.length && <li className="drop-line" aria-hidden="true" />}
+                      </ul>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          ))}
+      </div>
+      {deleteCandidate && (
+        <div className="modal-backdrop" onClick={() => setDeleteCandidate(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Delete card?</h3>
+            <p>{deleteCandidate.game_name}</p>
+            <div className="modal-actions">
+              <button type="button" className="secondary-btn" onClick={() => setDeleteCandidate(null)}>
+                Cancel
+              </button>
+              <button type="button" className="danger-btn" onClick={confirmDelete}>
+                Delete
+              </button>
+            </div>
           </div>
-        )}
-
-        {error && <div className="error">{error}</div>}
-
-        {activeTab === "Dashboard" && (
-          <section className="cards-grid">
-            <article className="card"><h3>Studios</h3><p>{dashboard.studios}</p></article>
-            <article className="card"><h3>Opportunities</h3><p>{dashboard.opportunities}</p></article>
-            <article className="card"><h3>Contracts</h3><p>{dashboard.contracts}</p></article>
-            <article className="card"><h3>Open Tasks</h3><p>{dashboard.openTasks}</p></article>
-            <article className="card"><h3>Active Deals</h3><p>{dashboard.activeDeals}</p></article>
-            <article className="card"><h3>Tasks due in 7d</h3><p>{dashboard.dueSoon}</p></article>
-          </section>
-        )}
-
-        {activeTab === "Studios" && (
-          <section className="two-col">
-            <form className="panel" onSubmit={submitStudio}>
-              <h3>Add Studio</h3>
-              <input required placeholder="Studio name" value={studioForm.name} onChange={(e) => setStudioForm({ ...studioForm, name: e.target.value })} />
-              <input placeholder="Website" value={studioForm.website} onChange={(e) => setStudioForm({ ...studioForm, website: e.target.value })} />
-              <input placeholder="Region" value={studioForm.region} onChange={(e) => setStudioForm({ ...studioForm, region: e.target.value })} />
-              <input placeholder="Genres (comma-separated)" value={studioForm.genres} onChange={(e) => setStudioForm({ ...studioForm, genres: e.target.value })} />
-              <label>
-                Reliability (1-5)
-                <input type="number" min="1" max="5" value={studioForm.reliability_score} onChange={(e) => setStudioForm({ ...studioForm, reliability_score: Number(e.target.value) })} />
-              </label>
-              <button disabled={!isSupabaseConfigured}>Create Studio</button>
-            </form>
-
-            <div className="panel">
-              <h3>Studios</h3>
-              <ul className="list">
-                {studios.map((s) => (
-                  <li key={s.id}>
-                    <strong>{s.name}</strong>
-                    <span>{s.region || "Unknown region"}</span>
-                    <span>Reliability: {s.reliability_score}/5</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </section>
-        )}
-
-        {activeTab === "Opportunities" && (
-          <section className="two-col">
-            <form className="panel" onSubmit={submitOpportunity}>
-              <h3>Add Opportunity</h3>
-              <input required placeholder="Game / opportunity title" value={opportunityForm.title} onChange={(e) => setOpportunityForm({ ...opportunityForm, title: e.target.value })} />
-              <select required value={opportunityForm.studio_id} onChange={(e) => setOpportunityForm({ ...opportunityForm, studio_id: e.target.value })}>
-                <option value="">Choose Studio</option>
-                {studios.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-              <select value={opportunityForm.status} onChange={(e) => setOpportunityForm({ ...opportunityForm, status: e.target.value })}>
-                <option value="sourced">Sourced</option>
-                <option value="contacted">Contacted</option>
-                <option value="evaluating">Evaluating</option>
-                <option value="negotiation">Negotiation</option>
-                <option value="signed">Signed</option>
-                <option value="launched">Launched</option>
-                <option value="rejected">Rejected</option>
-              </select>
-              <input placeholder="Owner" value={opportunityForm.owner} onChange={(e) => setOpportunityForm({ ...opportunityForm, owner: e.target.value })} />
-              <input placeholder="Next step" value={opportunityForm.next_step} onChange={(e) => setOpportunityForm({ ...opportunityForm, next_step: e.target.value })} />
-              <label>
-                Fit score
-                <input type="number" min="1" max="5" value={opportunityForm.fit_score} onChange={(e) => setOpportunityForm({ ...opportunityForm, fit_score: Number(e.target.value) })} />
-              </label>
-              <label>
-                Monetization score
-                <input type="number" min="1" max="5" value={opportunityForm.monetization_score} onChange={(e) => setOpportunityForm({ ...opportunityForm, monetization_score: Number(e.target.value) })} />
-              </label>
-              <label>
-                Strategic score
-                <input type="number" min="1" max="5" value={opportunityForm.strategic_score} onChange={(e) => setOpportunityForm({ ...opportunityForm, strategic_score: Number(e.target.value) })} />
-              </label>
-              <button disabled={!isSupabaseConfigured}>Create Opportunity</button>
-            </form>
-
-            <div className="panel">
-              <h3>Pipeline</h3>
-              <ul className="list">
-                {opportunities.map((o) => (
-                  <li key={o.id}>
-                    <strong>{o.title}</strong>
-                    <span>{o.studios?.name || "No studio"}</span>
-                    <span className={badgeClass(o.status)}>{o.status}</span>
-                    <span>Score: {o.fit_score + o.monetization_score + o.strategic_score}/15</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </section>
-        )}
-
-        {activeTab === "Contracts" && (
-          <section className="two-col">
-            <form className="panel" onSubmit={submitContract}>
-              <h3>Add Contract</h3>
-              <input required placeholder="Game title" value={contractForm.game_title} onChange={(e) => setContractForm({ ...contractForm, game_title: e.target.value })} />
-              <select required value={contractForm.studio_id} onChange={(e) => setContractForm({ ...contractForm, studio_id: e.target.value })}>
-                <option value="">Choose Studio</option>
-                {studios.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-              <select value={contractForm.status} onChange={(e) => setContractForm({ ...contractForm, status: e.target.value })}>
-                <option value="draft">Draft</option>
-                <option value="review">Review</option>
-                <option value="signed">Signed</option>
-                <option value="expired">Expired</option>
-              </select>
-              <label>
-                Revenue share %
-                <input type="number" min="0" max="100" value={contractForm.revenue_share_pct} onChange={(e) => setContractForm({ ...contractForm, revenue_share_pct: Number(e.target.value) })} />
-              </label>
-              <label>
-                Microtransaction split %
-                <input type="number" min="0" max="100" value={contractForm.microtx_share_pct} onChange={(e) => setContractForm({ ...contractForm, microtx_share_pct: Number(e.target.value) })} />
-              </label>
-              <label>
-                Start date
-                <input type="date" value={contractForm.start_date} onChange={(e) => setContractForm({ ...contractForm, start_date: e.target.value })} />
-              </label>
-              <label>
-                End date
-                <input type="date" value={contractForm.end_date} onChange={(e) => setContractForm({ ...contractForm, end_date: e.target.value })} />
-              </label>
-              <button disabled={!isSupabaseConfigured}>Create Contract</button>
-            </form>
-
-            <div className="panel">
-              <h3>Contracts</h3>
-              <ul className="list">
-                {contracts.map((c) => (
-                  <li key={c.id}>
-                    <strong>{c.game_title}</strong>
-                    <span>{c.studios?.name || "No studio"}</span>
-                    <span className={badgeClass(c.status)}>{c.status}</span>
-                    <span>{c.revenue_share_pct}% rev / {c.microtx_share_pct}% microtx</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </section>
-        )}
-
-        {activeTab === "Tasks" && (
-          <section className="two-col">
-            <form className="panel" onSubmit={submitTask}>
-              <h3>Add Task</h3>
-              <input required placeholder="Task title" value={taskForm.title} onChange={(e) => setTaskForm({ ...taskForm, title: e.target.value })} />
-              <input placeholder="Owner" value={taskForm.owner} onChange={(e) => setTaskForm({ ...taskForm, owner: e.target.value })} />
-              <select value={taskForm.status} onChange={(e) => setTaskForm({ ...taskForm, status: e.target.value })}>
-                <option value="open">Open</option>
-                <option value="in_progress">In progress</option>
-                <option value="blocked">Blocked</option>
-                <option value="done">Done</option>
-              </select>
-              <select value={taskForm.priority} onChange={(e) => setTaskForm({ ...taskForm, priority: e.target.value })}>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-              </select>
-              <select value={taskForm.related_type} onChange={(e) => setTaskForm({ ...taskForm, related_type: e.target.value })}>
-                <option value="opportunity">Opportunity</option>
-                <option value="contract">Contract</option>
-                <option value="studio">Studio</option>
-                <option value="general">General</option>
-              </select>
-              <label>
-                Due date
-                <input type="date" value={taskForm.due_date} onChange={(e) => setTaskForm({ ...taskForm, due_date: e.target.value })} />
-              </label>
-              <button disabled={!isSupabaseConfigured}>Create Task</button>
-            </form>
-
-            <div className="panel">
-              <h3>Task List</h3>
-              <ul className="list">
-                {tasks.map((t) => (
-                  <li key={t.id}>
-                    <strong>{t.title}</strong>
-                    <span className={badgeClass(t.status)}>{t.status}</span>
-                    <span>{t.priority}</span>
-                    <span>{t.due_date || "No due date"}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </section>
-        )}
-      </main>
+        </div>
+      )}
     </div>
   );
 }
